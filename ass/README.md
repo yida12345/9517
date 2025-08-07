@@ -8,7 +8,7 @@
   - Tingrui Zhang (z5616445)
   - Mochi Zhang (z5493308)
   - Shuochen Zhu (z5507779)
-  - Zhongwei Kou (z546772)
+  - Zhongwei Kou (z5467721)
   - Shuchang Xing (z5500862)
 
 ---
