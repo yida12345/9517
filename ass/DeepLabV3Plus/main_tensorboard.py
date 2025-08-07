@@ -1,0 +1,486 @@
+from os.path import splitext, isfile, join
+
+from torch import Tensor
+from tqdm import tqdm
+import network
+import utils
+import os
+import random
+import argparse
+import numpy as np
+
+from torch.utils import data
+# from datasets import VOCSegmentation, Cityscapes
+from utils import ext_transforms as et
+from metrics import StreamSegMetrics
+
+import torch
+import torch.nn as nn
+from utils.visualizer import Visualizer
+from torch.utils.tensorboard import SummaryWriter
+
+from PIL import Image
+import matplotlib
+import matplotlib.pyplot as plt
+from pathlib import Path
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+
+def get_argparser():
+    parser = argparse.ArgumentParser()
+
+    # Datset Options
+    parser.add_argument("--data_root", type=str, default='./datasets/data',
+                        help="path to Dataset")
+    parser.add_argument("--dataset", type=str, default='voc',
+                        choices=['voc', 'cityscapes'], help='Name of dataset')
+    parser.add_argument("--num_classes", type=int, default=1,
+                        help="num classes (default: None)")
+
+    # Deeplab Options
+    available_models = sorted(name for name in network.modeling.__dict__ if name.islower() and \
+                              not (name.startswith("__") or name.startswith('_')) and callable(
+                              network.modeling.__dict__[name])
+                              )
+    parser.add_argument("--model", type=str, default='deeplabv3plus_resnet50',
+                        choices=available_models, help='model name')
+    parser.add_argument("--separable_conv", action='store_true', default=False,
+                        help="apply separable conv to decoder and aspp")
+    parser.add_argument("--output_stride", type=int, default=16, choices=[8, 16])
+
+    # Train Options
+    parser.add_argument("--test_only", action='store_true', default=False)
+    parser.add_argument("--save_val_results", action='store_true', default=False,
+                        help="save segmentation results to \"./results\"")
+    parser.add_argument("--total_itrs", type=int, default=30e3,
+                        help="epoch number (default: 30k)")
+    parser.add_argument("--lr", type=float, default=0.01,
+                        help="learning rate (default: 0.01)")
+    parser.add_argument("--lr_policy", type=str, default='poly', choices=['poly', 'step'],
+                        help="learning rate scheduler policy")
+    parser.add_argument("--step_size", type=int, default=10000)
+    parser.add_argument("--crop_val", action='store_true', default=False,
+                        help='crop validation (default: False)')
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help='batch size (default: 16)')
+    parser.add_argument("--val_batch_size", type=int, default=4,
+                        help='batch size for validation (default: 4)')
+    parser.add_argument("--crop_size", type=int, default=513)
+
+    parser.add_argument("--ckpt", default=None, type=str,
+                        help="restore from checkpoint")
+    parser.add_argument("--continue_training", action='store_true', default=False)
+
+    parser.add_argument("--loss_type", type=str, default='cross_entropy',
+                        choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
+    parser.add_argument("--gpu_id", type=str, default='0',
+                        help="GPU ID")
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                        help='weight decay (default: 1e-4)')
+    parser.add_argument("--random_seed", type=int, default=1,
+                        help="random seed (default: 1)")
+    parser.add_argument("--print_interval", type=int, default=10,
+                        help="print interval of loss (default: 10)")
+    parser.add_argument("--val_interval", type=int, default=50,
+                        help="epoch interval for eval (default: 100)")
+    parser.add_argument("--download", action='store_true', default=False,
+                        help="download datasets")
+
+    # PASCAL VOC Options
+    parser.add_argument("--year", type=str, default='2012',
+                        choices=['2012_aug', '2012', '2011', '2009', '2008', '2007'], help='year of VOC')
+
+    # Visdom options
+    parser.add_argument("--enable_vis", action='store_true', default=True,
+                        help="use visdom for visualization")
+    parser.add_argument("--vis_port", type=str, default='13570',
+                        help='port for visdom')
+    parser.add_argument("--vis_env", type=str, default='main',
+                        help='env for visdom')
+    parser.add_argument("--vis_num_samples", type=int, default=8,
+                        help='number of samples for visualization (default: 8)')
+    return parser
+
+
+def compute_ndvi(rgb: np.ndarray, nrg: np.ndarray, eps=1e-6):
+    # nrg[0] = NIR, nrg[1] = R
+    nir = nrg[0].astype(np.float32)
+    red = nrg[1].astype(np.float32)
+    ndvi = (nir - red) / (nir + red + eps)
+    # normalize to [0,1]
+    ndvi = (ndvi + 1) / 2
+    return ndvi[np.newaxis, ...]
+
+def spectral_scale(img: np.ndarray, scale_range=(0.9, 1.1)):
+    """
+    img: numpy array, shape (C, H, W), float in [0,1]
+    scale_range: Scaling factor
+    """
+    C, H, W = img.shape
+    for c in range(C):
+        factor = np.random.uniform(*scale_range)
+        img[c] = np.clip(img[c] * factor, 0.0, 1.0)
+    return img
+
+class BasicDataset(data.Dataset):
+    def __init__(self, images_dir: str, dir_nrg: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = ''):
+        self.augment = False
+        self.images_dir = Path(images_dir)
+        self.nrg_dir = Path(dir_nrg)
+        self.mask_dir = Path(mask_dir)
+        assert 0 < scale <= 1, 'Scale must be between 0 and 1'
+        self.scale = scale
+        self.mask_suffix = mask_suffix
+        self.ids = [splitext(file)[0] for file in os.listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
+        if not self.ids:
+            raise RuntimeError(f'No input file found in {images_dir}, make sure you put your images there')
+        self.mask_values = [1]
+        self.mean = np.array([0.485, 0.456, 0.406, 0.5, 0.5], dtype=np.float32)
+        self.std = np.array([0.229, 0.224, 0.225, 0.1, 0.1], dtype=np.float32)
+
+    def __len__(self):
+        return len(self.ids)
+
+    @staticmethod
+    def preprocess(mask_values, pil_img, scale, is_mask):
+        w, h = pil_img.size
+        newW, newH = int(scale * w), int(scale * h)
+        assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
+        pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
+        img = np.asarray(pil_img)
+
+        if is_mask:
+            return (img > 0).astype(np.int8)
+        else:
+            if img.ndim == 2:
+                img = img[np.newaxis, ...]
+            else:
+                img = img.transpose((2, 0, 1))
+            if (img > 1).any():
+                img = img / 255.0
+            return img
+
+    def __getitem__(self, idx):
+        name = self.ids[idx]
+        mask_file = list(self.mask_dir.glob(name + self.mask_suffix + '.*'))
+        img_file = list(self.images_dir.glob(name + '.*'))
+        nrg_file = list(self.nrg_dir.glob(name + '.*'))
+        mask = Image.open(mask_file[0])
+        img  = Image.open(img_file[0])
+        nrg  = Image.open(nrg_file[0])
+        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
+        nrg = self.preprocess(self.mask_values, nrg, self.scale, is_mask=False)
+        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
+        ndvi = compute_ndvi(img, nrg)
+        r_chan = img[0:1, ...]  # (1, H, W)
+        g_chan = img[1:2, ...]  # (1, H, W)
+        b_chan = img[2:3, ...]  # (1, H, W)
+        nir_chan = nrg[0:1, ...]  # (1, H, W)
+
+        use = [r_chan, g_chan, b_chan, nir_chan, ndvi]
+        img = np.vstack(use)
+        img = (img - self.mean[:, None, None]) / self.std[:, None, None]
+
+        if self.augment:
+            img = spectral_scale(img, scale_range=(0.9, 1.1))
+            noise = np.random.normal(0, 0.02, size=img.shape).astype(np.float32)
+            img = np.clip(img + noise, 0.0, 1.0)
+        return {
+            'image': torch.as_tensor(img.copy()).float().contiguous(),
+            'mask': torch.as_tensor(mask.copy()).long().contiguous()
+        }
+
+
+
+def get_dataset(opts):
+    dir_img = Path('../USA_segmentation/resize/RGB_images')
+    dir_nrg = Path('../USA_segmentation/resize/NRG_images')
+    dir_mask = Path('../USA_segmentation/resize/masks')
+    train_dst = BasicDataset(os.path.join(dir_img,'train'), os.path.join(dir_nrg,'train'), os.path.join(dir_mask,'train'), 0.5)
+    val_dst = BasicDataset(os.path.join(dir_img,'val'), os.path.join(dir_nrg,'val'), os.path.join(dir_mask,'val'), 0.5)
+    return train_dst, val_dst
+
+
+def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
+    """
+    Validation
+        • Binary (num_classes==1): Dice
+        • Multi-class: StreamSegMetrics (mIoU, Acc …)
+    """
+    ret_samples = [] if ret_samples_ids is not None else None
+
+    # ---------- Binary segmentation ----------
+    if opts.num_classes == 1:
+        dice_sum = 0.0
+        with torch.no_grad():
+            for i, batch in tqdm(enumerate(loader), total=len(loader), desc='Val'):
+                images, labels = batch['image'], batch['mask']
+                images = images.to(device, dtype=torch.float32)
+                labels = labels.to(device, dtype=torch.float32)       # [B,1,H,W]
+                logits = model(images).squeeze(1)                    # [B,H,W]
+                preds  = (torch.sigmoid(logits) > 0.5).float()
+
+                dice_sum += dice_coeff(preds, labels, reduce_batch_first=False).item()
+
+                if ret_samples is not None and i in ret_samples_ids:
+                    ret_samples.append((images[0].cpu(), labels[0].cpu(), preds[0].cpu()))
+
+        return {'Dice': dice_sum / max(len(loader), 1)}, ret_samples
+
+    # ---------- Multi-class segmentation ----------
+    metrics.reset()
+    with torch.no_grad():
+        for i, batch in tqdm(enumerate(loader), total=len(loader), desc='Val'):
+            images, labels = batch['image'], batch['mask']
+            images = images.to(device, dtype=torch.float32)
+            labels = labels.to(device, dtype=torch.long)
+            preds = model(images).detach().max(dim=1)[1].cpu().numpy()
+            targets = labels.cpu().numpy()
+            metrics.update(targets, preds)
+
+            if ret_samples is not None and i in ret_samples_ids:
+                ret_samples.append((images[0].cpu(), targets[0], preds[0]))
+
+    return metrics.get_results(), ret_samples
+
+def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6):
+    assert input.size() == target.size()
+    # If it is [N, 1, H, W], flatten it first to [N, H, W].
+    if reduce_batch_first:
+        sum_dim = (-1, -2, -3)
+    else:
+        sum_dim = (-1, -2)
+    inter = 2 * (input * target).sum(dim=sum_dim)
+    sets_sum = input.sum(dim=sum_dim) + target.sum(dim=sum_dim)
+    sets_sum = torch.where(sets_sum == 0, inter, sets_sum)
+    dice = (inter + epsilon) / (sets_sum + epsilon)
+    return dice.mean()
+
+def dice_loss(input: Tensor, target: Tensor):
+    # The input is already the probability after sigmoid, and the target is a float.
+    return 1 - dice_coeff(input, target, reduce_batch_first=True)
+
+
+def main():
+    opts = get_argparser().parse_args()
+    # if opts.dataset.lower() == 'voc':
+    #     opts.num_classes = 21
+    # elif opts.dataset.lower() == 'cityscapes':
+    #     opts.num_classes = 19
+    opts.num_classes = 1
+    writer = SummaryWriter(comment=f'_lr{opts.lr}_bs{opts.batch_size}')
+    writer.add_hparams({
+            'total_itrs': opts.total_itrs,
+            'batch_size': opts.batch_size,
+            'learning_rate': opts.lr,
+            'loss': 'BCE+Dice',}, {})
+
+    # Setup visualization
+    # vis = Visualizer(port=opts.vis_port, env=opts.vis_env) if opts.enable_vis else None
+    vis = None
+    if vis is not None:  # display options
+        vis.vis_table("Options", vars(opts))
+
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("Device: %s" % device)
+
+    # Setup random seed
+    torch.manual_seed(opts.random_seed)
+    np.random.seed(opts.random_seed)
+    random.seed(opts.random_seed)
+
+    # Setup dataloader
+    if opts.dataset == 'voc' and not opts.crop_val:
+        opts.val_batch_size = 1
+
+    train_dst, val_dst = get_dataset(opts)
+    train_loader = data.DataLoader(
+        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
+        drop_last=True)  # drop_last=True to ignore single-image batches.
+    val_loader = data.DataLoader(
+        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+    print("Dataset: %s, Train set: %d, Val set: %d" %
+          (opts.dataset, len(train_dst), len(val_dst)))
+
+    # Set up model (all models are 'constructed at network.modeling)
+    model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
+    if opts.separable_conv and 'plus' in opts.model:
+        network.convert_to_separable_conv(model.classifier)
+    utils.set_bn_momentum(model.backbone, momentum=0.01)
+
+    old_conv = model.backbone.conv1
+    new_conv = torch.nn.Conv2d(
+        in_channels=5,
+        out_channels=old_conv.out_channels,
+        kernel_size=old_conv.kernel_size,
+        stride=old_conv.stride,
+        padding=old_conv.padding,
+        bias=False
+    )
+    # Copy the pre-trained weights to the first 3 channels, and randomly initialize the remaining ones.
+    with torch.no_grad():
+        new_conv.weight[:, :3, :, :] = old_conv.weight
+        new_conv.weight[:, 3:, :, :].normal_(mean=0.0, std=0.01)
+
+    # replace
+    model.backbone.conv1 = new_conv
+
+    # Set up metrics
+    metrics = StreamSegMetrics(opts.num_classes)
+
+    # Set up optimizer
+    optimizer = torch.optim.SGD(params=[
+        {'params': model.backbone.parameters(), 'lr': 0.1 * opts.lr},
+        {'params': model.classifier.parameters(), 'lr': opts.lr},
+    ], lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
+    if opts.lr_policy == 'poly':
+        scheduler = utils.PolyLR(optimizer, opts.total_itrs, power=0.9)
+    elif opts.lr_policy == 'step':
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.step_size, gamma=0.1)
+
+    # Set up criterion
+    # criterion = utils.get_loss(opts.loss_type)
+    bce_criterion = nn.BCEWithLogitsLoss()
+
+    def save_ckpt(path):
+        """ save current model
+        """
+        torch.save({
+            "cur_itrs": cur_itrs,
+            "model_state": model.module.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "best_score": best_score,
+        }, path)
+        print("Model saved as %s" % path)
+
+    utils.mkdir('checkpoints')
+    # Restore
+    best_score = 0.0
+    cur_itrs = 0
+    cur_epochs = 0
+    if opts.ckpt is not None and os.path.isfile(opts.ckpt):
+        # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
+        checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
+        model.load_state_dict(checkpoint["model_state"])
+        model = nn.DataParallel(model)
+        model.to(device)
+        if opts.continue_training:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            scheduler.load_state_dict(checkpoint["scheduler_state"])
+            cur_itrs = checkpoint["cur_itrs"]
+            best_score = checkpoint['best_score']
+            print("Training state restored from %s" % opts.ckpt)
+        print("Model restored from %s" % opts.ckpt)
+        del checkpoint  # free memory
+    else:
+        print("[!] Retrain")
+        model = nn.DataParallel(model)
+        model.to(device)
+
+    # ==========   Train Loop   ==========#
+    vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
+                                      np.int32) if opts.enable_vis else None  # sample idxs for visualization
+    denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406, 0.5, 0.5], std=[0.229, 0.224, 0.225, 0.1, 0.1])  # denormalization for ori images
+
+    if opts.test_only:
+        model.eval()
+        val_score, ret_samples = validate(
+            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
+        print(metrics.to_str(val_score))
+        return
+
+    interval_loss = 0
+    epoch_loss = 0
+    while True:  # cur_itrs < opts.total_itrs:
+        # =====  Train  =====
+        model.train()
+        cur_epochs += 1
+        for batch in train_loader:
+            images, labels = batch['image'], batch['mask']
+            cur_itrs += 1
+
+            images = images.to(device, dtype=torch.float32)
+            labels = labels.to(device, dtype=torch.long)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            # loss = criterion(outputs, labels)
+            bce = bce_criterion(outputs.squeeze(1), labels.float(),)  # labels  [N,1,H,W] float 0/1
+            probs = torch.sigmoid(outputs.squeeze(1))
+            d_loss = dice_loss(probs, labels.float())  # float in [0,1]
+            loss = bce + d_loss
+            loss.backward()
+            optimizer.step()
+
+            np_loss = loss.detach().cpu().numpy()
+            interval_loss += np_loss
+            epoch_loss += np_loss
+
+            # ─── TensorBoard: train ───
+            writer.add_scalar('train/loss', np_loss, cur_itrs)
+            writer.add_scalar('train/epoch', cur_epochs, cur_itrs)
+
+            if vis is not None:
+                vis.vis_scalar('Loss', cur_itrs, np_loss)
+
+            if (cur_itrs) % 10 == 0:
+                interval_loss = interval_loss / 10
+                print("Epoch %d, Itrs %d/%d, Loss=%f" %
+                      (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
+                interval_loss = 0.0
+
+            if (cur_itrs) % opts.val_interval == 0:
+                save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
+                          (opts.model, opts.dataset, opts.output_stride))
+                print("validation...")
+                model.eval()
+                val_score, ret_samples = validate(
+                    opts=opts, model=model, loader=val_loader, device=device,
+                    metrics=metrics, ret_samples_ids=vis_sample_id)
+                if opts.num_classes == 1:
+                    cur_metric = val_score['Dice']
+                    print(f'Validation Dice: {cur_metric:.4f}')
+                else:
+                    cur_metric = val_score['Mean IoU']
+                    print(metrics.to_str(val_score))
+                # ─── TensorBoard ───
+                writer.add_scalar('val/dice', cur_metric, cur_itrs)
+                writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], cur_itrs)
+                writer.add_scalar('train/epoch_loss', epoch_loss, cur_itrs)
+                # save img
+                if ret_samples:
+                    imgs, gts, prds = [], [], []
+                    for s in ret_samples[:4]:
+                        img, gt, pr = s
+                        imgs.append(img[0:3, ...])  # RGB 3
+                        gts.append(gt.unsqueeze(0).float())
+                        prds.append(pr.unsqueeze(0).float())
+                    writer.add_images('val/example_images', torch.stack(imgs), cur_itrs)
+                    writer.add_images('val/true_masks', torch.stack(gts), cur_itrs)
+                    writer.add_images('val/pred_masks', torch.stack(prds), cur_itrs)
+                for tag, value in model.named_parameters():
+                    tag = tag.replace('.', '/')
+                    if not (torch.isinf(value) | torch.isnan(value)).any():
+                        writer.add_histogram('Weights/' + tag, value.data.cpu(), cur_itrs)
+                    if value.grad is not None and not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                         writer.add_histogram('Gradients/' + tag, value.grad.data.cpu(), cur_itrs)
+                # save best
+                if cur_metric > best_score:
+                    best_score = cur_metric
+                    save_ckpt('checkpoints/best_%s_%s_os%d.pth' %(opts.model, opts.dataset, opts.output_stride))
+
+
+
+                model.train()
+            scheduler.step()
+
+            if cur_itrs >= opts.total_itrs:
+                writer.close()
+                return
+
+
+if __name__ == '__main__':
+    main()

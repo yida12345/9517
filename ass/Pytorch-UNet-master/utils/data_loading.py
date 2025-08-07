@@ -145,15 +145,26 @@ class BasicDataset(Dataset):
         nrg = self.preprocess(self.mask_values, nrg, self.scale, is_mask=False)
         mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
         ndvi = compute_ndvi(img, nrg)
+        r_chan = img[0:1, ...]  # (1, H, W)
+        g_chan = img[1:2, ...]  # (1, H, W)
+        b_chan = img[2:3, ...]  # (1, H, W)
+        nir_chan = nrg[0:1, ...]  # (1, H, W)
 
-        img7 = np.vstack([img, nrg, ndvi])
+        # use = [img, nrg, ndvi]
+        # use = [r_chan, g_chan, nir_chan, ndvi]
+        use = [r_chan, g_chan, b_chan, nir_chan, ndvi]
+        # use = [r_chan, g_chan, b_chan, nir_chan]
+        # use = [g_chan,ndvi]
+        # [r, g, b, n, ndvi]-2.5bei
+
+        img = np.vstack(use)
+
         if self.augment:
-            img7 = spectral_scale(img7, scale_range=(0.9, 1.1))
-            noise = np.random.normal(0, 0.02, size=img7.shape).astype(np.float32)
-            img7 = np.clip(img7 + noise, 0.0, 1.0)
-
+            img = spectral_scale(img, scale_range=(0.9, 1.1))
+            noise = np.random.normal(0, 0.02, size=img.shape).astype(np.float32)
+            img = np.clip(img + noise, 0.0, 1.0)
         return {
-            'image': torch.as_tensor(img7.copy()).float().contiguous(),
+            'image': torch.as_tensor(img.copy()).float().contiguous(),
             'mask': torch.as_tensor(mask.copy()).long().contiguous()
         }
 

@@ -34,7 +34,7 @@ def train_model(
         device,
         epochs: int = 5,
         batch_size: int = 1,
-        learning_rate: float = 1e-5,
+        learning_rate: float = 1e-6,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
@@ -48,20 +48,21 @@ def train_model(
     #     dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
     # except (AssertionError, RuntimeError, IndexError):
     #     dataset = BasicDataset(dir_img, dir_mask, img_scale)
-    dataset = BasicDataset(dir_img, dir_nrg, dir_mask, img_scale)
-    pos_weight = torch.tensor(5, device=device)
+    dataset = BasicDataset(os.path.join(dir_img,'train'), os.path.join(dir_nrg,'train'), os.path.join(dir_mask,'train'), img_scale)
+    dataset_val = BasicDataset(os.path.join(dir_img,'val'), os.path.join(dir_nrg,'val'), os.path.join(dir_mask,'val'), img_scale)
+    pos_weight = torch.tensor(3, device=device)
 
     # 2. Split into train / validation partitions
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
-    train_set.dataset.augment = True
+    # n_val = int(len(dataset) * val_percent)
+    # n_train = len(dataset) - n_val
+    # train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+    dataset.augment = True
 
     # 3. Create data loaders
     # loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
     loader_args = dict(batch_size=batch_size, num_workers=2, pin_memory=False, prefetch_factor=1, persistent_workers=False)
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
+    train_loader = DataLoader(dataset, shuffle=True, **loader_args)
+    val_loader = DataLoader(dataset_val, shuffle=False, drop_last=True, **loader_args)
 
     # ──────────────────────────────────────────────
     # TensorBoard：初始化 SummaryWriter
@@ -84,8 +85,8 @@ def train_model(
         Epochs:          {epochs}
         Batch size:      {batch_size}
         Learning rate:   {learning_rate}
-        Training size:   {n_train}
-        Validation size: {n_val}
+        Training size:   {len(dataset)}
+        Validation size: {len(dataset_val)}
         Checkpoints:     {save_checkpoint}
         Device:          {device.type}
         Images scaling:  {img_scale}
@@ -105,7 +106,7 @@ def train_model(
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0
-        with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
+        with tqdm(total=len(dataset), desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
 
@@ -120,24 +121,24 @@ def train_model(
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
                     if model.n_classes == 1:
-                        # loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        # loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
+                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
                         # # 1) BCE with pos_weight
-                        logits = masks_pred.squeeze(1)  # (B, H, W)
-                        loss_bce = criterion(logits, true_masks.float())
-
-                        # 2) 加权 Dice loss
-                        probs = torch.sigmoid(logits)  # (B, H, W)
-                        # 传入一个 “前景权重” 给 dice_loss
-                        # 注意：dice_loss 新版签名 dice_loss(input, target, multiclass, class_weight)
-                        loss_dice = dice_loss(
-                            probs,
-                            true_masks.float(),
-                            multiclass=False,
-                            class_weight=pos_weight  # 也可以用一个标量 tensor([99]) 来只给前景加权
-                        )
-
-                        loss = loss_bce + loss_dice
+                        # logits = masks_pred.squeeze(1)  # (B, H, W)
+                        # loss_bce = criterion(logits, true_masks.float())
+                        #
+                        # # 2) 加权 Dice loss
+                        # probs = torch.sigmoid(logits)  # (B, H, W)
+                        # # 传入一个 “前景权重” 给 dice_loss
+                        # # 注意：dice_loss 新版签名 dice_loss(input, target, multiclass, class_weight)
+                        # loss_dice = dice_loss(
+                        #     probs,
+                        #     true_masks.float(),
+                        #     multiclass=False,
+                        #     class_weight=pos_weight  # 也可以用一个标量 tensor([99]) 来只给前景加权
+                        # )
+                        #
+                        # loss = loss_bce + loss_dice
 
                     else:
                         loss = criterion(masks_pred, true_masks)
@@ -194,12 +195,13 @@ def train_model(
         #                   global_step)
         writer.add_scalar('val/dice', val_score, global_step)
         writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step)
+        writer.add_scalar('train/epoch_loss', epoch_loss, global_step)
 
         # 把 6 通道拆成 RGB (0,1,2) 和 NRG (3,4,5) 两组三通道分别可视化
-        rgb_imgs = images[:, 0:3, :, :].cpu()
-        nrg_imgs = images[:, 3:6, :, :].cpu()
-        writer.add_images('val/rgb_images', rgb_imgs[:4], global_step)
-        writer.add_images('val/nrg_images', nrg_imgs[:4], global_step)
+        # rgb_imgs = images[:, 0:3, :, :].cpu()
+        # nrg_imgs = images[:, 3:6, :, :].cpu()
+        # writer.add_images('val/rgb_images', rgb_imgs[:4], global_step)
+        # writer.add_images('val/nrg_images', nrg_imgs[:4], global_step)
 
         # 真实 mask（二分类）和预测 mask（sigmoid threshold）
         true_masks_viz = true_masks[:4].unsqueeze(1).float().cpu()
@@ -216,7 +218,7 @@ def train_model(
 
         # ──────────────────────────────────────────────
 
-        if save_checkpoint:
+        if save_checkpoint and epoch % 5 == 0:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
             state_dict['mask_values'] = dataset.mask_values
@@ -231,7 +233,7 @@ def train_model(
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=50, help='Number of epochs')
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=200, help='Number of epochs')
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=8, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-6,
                         help='Learning rate', dest='lr')
@@ -253,7 +255,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
-    model = UNet(n_channels=7, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet(n_channels=5, n_classes=args.classes, bilinear=args.bilinear)
     # model = model.to(memory_format=torch.channels_last)
     # model = model.to(device)
 
